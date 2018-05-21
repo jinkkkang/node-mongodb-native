@@ -1,21 +1,22 @@
 'use strict';
 
-var setupDatabase = require('./shared').setupDatabase;
+const EJSON = require('mongodb-extjson');
 const chai = require('chai');
 const fs = require('fs');
-const expect = chai.expect;
 const camelCase = require('lodash.camelcase');
-chai.use(require('chai-subset'));
+const MongoClient = require('../../lib/mongo_client');
+const setupDatabase = require('./shared').setupDatabase;
+const delay = require('./shared').delay;
+const expect = chai.expect;
 
-describe.only('Change Stream Spec', function() {
+describe('Change Stream Spec', function() {
   const specStr = fs.readFileSync(`${__dirname}/spec/change-stream/change-streams.json`, 'utf8');
   const specData = JSON.parse(specStr);
   const ALL_DBS = [specData.database_name, specData.database_name_2];
 
-  const delay = ms => new Promise(r => setTimeout(r, ms));
+  const EJSONToJSON = x => JSON.parse(EJSON.stringify(x));
 
   before(function() {
-    const MongoClient = this.configuration.require.MongoClient;
     return setupDatabase(this.configuration, ALL_DBS).then(() => {
       this.globalClient = new MongoClient(this.configuration.url());
       return this.globalClient.connect();
@@ -34,14 +35,11 @@ describe.only('Change Stream Spec', function() {
     const sColl = specData.collection_name;
     return Promise.all(ALL_DBS.map(db => gc.db(db).dropDatabase()))
       .then(() => gc.db(sDB).createCollection(sColl))
-      .then(() => {
-        const MongoClient = this.configuration.require.MongoClient;
-
-        return new MongoClient(this.configuration.url(), { monitorCommands: true }).connect();
-      })
+      .then(() => new MongoClient(this.configuration.url(), { monitorCommands: true }).connect())
       .then(client => {
         const ctx = (this.ctx = {});
         const events = (this.events = []);
+        ctx.gc = gc;
         ctx.client = client;
         ctx.db = ctx.client.db(sDB);
         ctx.collection = ctx.db.collection(sColl);
@@ -61,7 +59,7 @@ describe.only('Change Stream Spec', function() {
     }
   });
 
-  specData.tests.map(test => Object.assign({}, specData.defaults, test)).forEach(test => {
+  specData.tests.forEach(test => {
     const itFn = test.skip ? it.skip : test.only ? it.only : it;
     const metadata = generateMetadata(test);
     const testFn = generateTestFn(test);
@@ -107,7 +105,8 @@ describe.only('Change Stream Spec', function() {
       }
 
       if (result.success) {
-        expect(value).to.containSubset(result.success);
+        value = EJSONToJSON(value);
+        assertEquality(value, result.success);
       }
     };
   }
@@ -120,7 +119,7 @@ describe.only('Change Stream Spec', function() {
         throw err;
       }
 
-      expect(err).to.containSubset(result.error);
+      assertEquality(err, result.error);
     };
   }
 
@@ -132,8 +131,13 @@ describe.only('Change Stream Spec', function() {
         .map(e => e.command_started_event)
         .map(normalizeAPMEvent)
         .forEach((expected, idx) => {
-          const actual = events[idx];
-          expect(actual).to.containSubset(expected);
+          if (!events[idx]) {
+            throw new Error(
+              `Expected there to be an APM event at index ${idx}, but there was none`
+            );
+          }
+          const actual = EJSONToJSON(events[idx]);
+          assertEquality(actual, expected);
         });
     };
   }
@@ -141,12 +145,15 @@ describe.only('Change Stream Spec', function() {
   function makeTestFnRunOperations(test) {
     const target = test.target;
     const operations = test.operations;
+    const success = test.result.success || [];
 
     return function testFnRunOperations(ctx) {
-      ctx.changeStream = ctx[target].watch();
+      const changeStreamPipeline = test.changeStreamPipeline;
+      const changeStreamOptions = test.changeStreamOptions;
+      ctx.changeStream = ctx[target].watch(changeStreamPipeline, changeStreamOptions);
 
-      const changeStreamPromise = readAndCloseChangeStream(ctx.changeStream, test.numChanges);
-      const operationsPromise = runOperations(ctx, operations);
+      const changeStreamPromise = readAndCloseChangeStream(ctx.changeStream, success.length);
+      const operationsPromise = runOperations(ctx.gc, operations);
 
       return Promise.all([changeStreamPromise, operationsPromise]).then(args => args[0]);
     };
@@ -154,8 +161,7 @@ describe.only('Change Stream Spec', function() {
 
   function readAndCloseChangeStream(changeStream, numChanges) {
     const close = makeChangeStreamCloseFn(changeStream);
-    let changeStreamPromise =
-      numChanges > 0 ? changeStream.next().then(r => [r]) : Promise.resolve([]);
+    let changeStreamPromise = changeStream.next().then(r => [r]);
 
     for (let i = 1; i < numChanges; i += 1) {
       changeStreamPromise = changeStreamPromise.then(results => {
@@ -169,8 +175,10 @@ describe.only('Change Stream Spec', function() {
     return changeStreamPromise.then(result => close(null, result), err => close(err));
   }
 
-  function runOperations(ctx, operations) {
-    return operations.map(op => makeOperation(ctx, op)).reduce((p, op) => p.then(op), delay(100));
+  function runOperations(client, operations) {
+    return operations
+      .map(op => makeOperation(client, op))
+      .reduce((p, op) => p.then(op), delay(200));
   }
 
   function makeChangeStreamCloseFn(changeStream) {
@@ -193,10 +201,48 @@ describe.only('Change Stream Spec', function() {
     }, {});
   }
 
-  function makeOperation(ctx, op) {
-    const target = ctx.client.db(op.database).collection(op.collection);
-    const command = op.commandName;
-    const args = op.arguments || undefined;
+  function makeOperation(client, op) {
+    const target = client.db(op.database).collection(op.collection);
+    const command = op.name;
+    const args = [];
+    if (op.arguments && op.arguments.document) {
+      args.push(op.arguments.document);
+    }
     return () => target[command].apply(target, args);
+  }
+
+  function assertEquality(actual, expected) {
+    try {
+      _assertEquality(actual, expected);
+    } catch (e) {
+      console.dir(actual, { depth: 999 });
+      console.dir(expected, { depth: 999 });
+      throw e;
+    }
+  }
+
+  function _assertEquality(actual, expected) {
+    try {
+      if (expected === '42' || expected === 42) {
+        expect(actual).to.exist;
+        return;
+      }
+
+      expect(actual).to.be.a(Array.isArray(expected) ? 'array' : typeof expected);
+
+      if (expected == null) {
+        expect(actual).to.not.exist;
+      } else if (Array.isArray(expected)) {
+        expected.forEach((ex, idx) => _assertEquality(actual[idx], ex));
+      } else if (typeof expected === 'object') {
+        for (let i in expected) {
+          _assertEquality(actual[i], expected[i]);
+        }
+      } else {
+        expect(actual).to.equal(expected);
+      }
+    } catch (e) {
+      throw e;
+    }
   }
 });

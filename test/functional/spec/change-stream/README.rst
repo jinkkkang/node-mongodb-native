@@ -18,34 +18,30 @@ drivers can use to prove their conformance to the Change Streams Spec.
 Several prose tests, which are not easily expressed in YAML, are also presented
 in this file. Those tests will need to be manually implemented by each driver.
 
-Test Format
-===========
+Spec Test Format
+================
 
 Each YAML files has the following keys:
 
 - ``database_name``: The default database
 - ``collection_name``: The default collection
-- ``defaults``: Default values for each test
 - ``tests``: An array of tests that are to be run independently of each other.
   Each test will have some of the following fields:
 
   - ``description``: The name of the test.
-  - ``skip``: Notes that this test is incomplete and should not be run
   - ``minServerVersion``: The minimum server version to run this test against. If not present, assume there is no minimum server version.
   - ``maxServerVersion``: Reserved for later use
   - ``failPoint``: Reserved for later use
-  - ``topology``: The server topology/topologies to run the test against.
-    Valid topologies are ``single``, ``replicaset``, and ``sharded``.
-    Can be either a single topology, or a list of topologies.
   - ``target``: The entity to run a changeStream on. Valid values are:
   
     - ``collection``: Watch changes on collection ``database_name.collection_name``
     - ``db``: Watch changes on database ``database_name``
     - ``client``: Watch changes on entire clusters
-
-  - ``numChanges``: The number of changes to expect on a changeStream
+  - ``topology``: An array of server topologies to run the test against
+    Valid topologies are ``single``, ``replicaset``, and ``sharded``.
+  - ``changeStreamPipeline``: An array of additional aggregation pipeline stages to add to the change stream
+  - ``changeStreamOptions``: Additional options to add to the changeStream
   - ``operations``: Array of documents, each describing an operation. Each document has the following fields:
-
     - ``database``: Database to run the operation against
     - ``collection``: Collection to run the operation against
     - ``commandName``: Name of the command to run
@@ -57,30 +53,63 @@ Each YAML files has the following keys:
     - ``error``: Describes an error received during the test
     - ``success``: An array of documents expected to be received from the changeStream
 
-For every test, if a value does not exist, a value from ``defaults`` should be used in its place.
-
-Use as integration tests
+Spec Test Match Function
 ========================
 
-The use of the words MATCH and MATCHES, unless otherwise specified, means that every "expected" value is contained in the "actual" value. There may be values present in "actual" that are not present in "expected", but there must not be values in "expected" that are not present in "actual". This is recursive as well: any sub-fields of "expected" must MATCH the corresponding sub-field in "actual"
+The definition of MATCH or MATCHES in the Spec Test Runner is as follows:
 
-Before running the tests, create a MongoDB server topology.
+- MATCH takes two values, ``expected`` and ``actual``
+- Notation is "Assert [actual] MATCHES [expected]
+- Assertion passes if ``expected`` is a subset of ``actual``, with the values ``42`` and ``"42"`` acting as placeholders for "any value"
+
+Pseudocode Implementation of ``actual`` MATCHES ``expected``:
+
+- If ``expected`` is ``"42"`` or ``42``
+
+  - Assert that ``actual`` exists (is not ``null`` or ``undefined``)
+
+- Else
+
+  - Assert that ``actual`` is of the same JSON type as ``expected``
+  - If ``expected`` is a ``number``, ``string``, ``boolean`` or ``null``
+
+    - Assert that ``expected`` equals ``actual``
+
+  - Else if ``expected`` is an ``array``
+
+    - for every ``idx``/``value`` in ``expected``
+
+      - Assert that ``value`` MATCHES ``actual[idx]``
+
+  - Else
+
+    - for every ``key``/``value`` in ``expected``
+
+      - Assert that ``value`` MATCHES ``actual``
+
+Spec Test Runner
+================
+
+Before running the tests
+
+- Create a MongoDB server topology.
+- Create a MongoClient ``globalClient``, and connect to the server
 
 For each YAML file, for each element in ``tests``:
 
-- If the test has ``skip: true``, or the ``topology`` does not match the topology of the server instance(s), skip this test.
-- Use either a global MongoClient or a temporary MongoClient to:
+- If ``topology`` does not include the topology of the server instance(s), skip this test.
+- Use ``globalClient`` to
 
   - Drop the database ``database_name``
   - Create the database ``database_name`` and the collection ``database_name.collection_name``
 
 - Create a new MongoClient ``client``, with APM enabled
-- Create a changeStream ``changeStream`` against the specified ``target``
-- Run every operation in ``operations`` in serial against the server
+- Using ``client``, create a changeStream ``changeStream`` against the specified ``target``. Use ``changeStreamPipeline`` and ``changeStreamOptions`` if they are non-empty
+- Using ``globalClient``, run every operation in ``operations`` in serial against the server
 - Wait until either
 
   - An error occurres
-  - All operations have been successful AND the changeStream has received ``numChanges`` changes
+  - All operations have been successful AND the changeStream has received as many changes as there are ``result.success``
 
 - Close ``changeStream``
 - If there was an error
@@ -95,6 +124,33 @@ For each YAML file, for each element in ``tests``:
 
 - If there are any ``expectations``
 
-  - assert that they MATCH the actual APM events
+  - For each APM ``commandStarted`` events on ``client``
+
+    - Filter out any ``ismaster`` events
+
+  - For each (``expected``, ``idx``) in ``expectations``
+
+    - Assert that ``actual[idx]`` MATCHES ``expected``
 
 - Close the MongoClient ``client``
+
+After running all tests
+
+- Close the MongoClient ``globalClient``
+- Shut down the server topology
+
+
+Prose Tests
+===========
+
+The following tests have not yet been automated, but MUST still be tested
+
+1. ``ChangeStream`` must continuously track the last seen ``resumeToken``
+2. ``ChangeStream`` will throw an exception if the server response is missing the resume token
+3. ``ChangeStream`` will automatically resume one time on a resumable error (including `not master`) with the initial pipeline and options, except for the addition/update of a ``resumeToken``.
+4. ``ChangeStream`` will not attempt to resume on a server error
+5. ``ChangeStream`` will perform server selection before attempting to resume, using initial ``readPreference``
+6. Ensure that a cursor returned from an aggregate command with a cursor id, and an initial empty batch, is not closed on the driver side.
+7. The ``killCursors`` command sent during the “Resume Process” must not be allowed to throw an exception.
+8. ``$changeStream`` stage for ``ChangeStream`` against a server ``>=4.0`` that has not received any results yet MUST include a ``startAtClusterTime`` when resuming a changestream.
+9. ``ChangeStream`` will resume after a ``killCursors`` command is issued for its child cursor.

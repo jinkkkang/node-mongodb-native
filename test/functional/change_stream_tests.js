@@ -1493,7 +1493,51 @@ describe('Change Streams', function() {
     }
   });
 
-  it('Should include a startAtClusterTime field when resuming if no changes have been received', {
+  // TODO: Need to reimplement resuming on most getMores before we can run this test
+  it.skip('Should resume after a killCursors command is issued for its child cursor', {
+    metadata: { requires: { topology: 'replicaset', mongodb: '>=3.5.10' } },
+    test: function(done) {
+      const configuration = this.configuration;
+      const MongoClient = configuration.require.MongoClient;
+      const client = new MongoClient(configuration.url());
+
+      const collectionName = 'resumeAfterKillCursor';
+
+      let db;
+      let coll;
+      let changeStream;
+
+      function close(e) {
+        changeStream.close(() => client.close(() => done(e)));
+      }
+
+      client
+        .connect()
+        .then(() => (db = client.db('integration_tests')))
+        .then(() => (coll = db.collection(collectionName)))
+        .then(() => (changeStream = coll.watch()))
+        .then(() => ({ p: changeStream.next() }))
+        .then(x => coll.insertOne({ darmok: 'jalad' }).then(() => x.p))
+        .then(() =>
+          db.command({
+            killCursors: collectionName,
+            cursors: [changeStream.cursor.cursorState.cursorId]
+          })
+        )
+        .then(() => console.log('fizz'))
+        .then(() => coll.insertOne({ shaka: 'walls fell' }))
+        .then(() => changeStream.next())
+        .then(change => {
+          expect(change).to.have.property('operationType', 'insert');
+          expect(change)
+            .to.have.property('fullDocument')
+            .that.deep.equals({ shaka: 'walls fell' });
+        })
+        .then(() => close(), e => close(e));
+    }
+  });
+
+  it('Should include a startAtOperationTime field when resuming if no changes have been received', {
     metadata: { requires: { topology: 'replicaset', mongodb: '>=3.7.3' } },
     test: function(done) {
       const configuration = this.configuration;
@@ -1547,7 +1591,7 @@ describe('Change Streams', function() {
       const port = '32000';
       const url = `mongodb://${host}:${port}/`;
       const dbName = 'integration_tests';
-      const collectionName = 'resumeWithStartAtClusterTime';
+      const collectionName = 'resumeWithStartAtOperationTime';
       const connectOptions = {
         socketTimeoutMS: 500,
         validateOptions: true
@@ -1576,7 +1620,9 @@ describe('Change Streams', function() {
               return;
             }
 
-            expect(doc).to.have.nested.property('pipeline[0].$changeStream.startAtClusterTime');
+            expect(doc)
+              .to.have.nested.property('pipeline[0].$changeStream.startAtOperationTime')
+              .that.deep.equals(ismaster.operationTime);
             expect(doc).to.not.have.nested.property('pipeline[0].$changeStream.resumeAfter');
 
             request.reply(changeDoc, { cursorId: new Long(1407, 1407) });
